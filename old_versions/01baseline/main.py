@@ -1,12 +1,9 @@
-"""Версия 2: char n-grams для заголовка + word-level TF-IDF для описания
-
-Заголовок и описание индексируются отдельно, затем их сходства объединяются с весами 0.8 и 0.2
-
-Локальная валидация делится по уникальным поисковым запросам
-
+"""Version 1: простой baseline на TF-IDF
+Использует заголовок и описание объявления, а затем ищет top-50 по косинусной близости
+Локальная валидация делится по уникальным поисковым запросам, чтобы избежать утечки
 Запуск:
-    Разместить `train.parquet`, `benchmark_queries.parquet` и `benchmark_items.parquet` в корень проекта
-    `python main2.py`
+    Разместить `train.parquet` `benchmark_queries.parquet` `benchmark_items.parquet` в корень проекта
+    `python main.py` 
 """
 from __future__ import annotations
 
@@ -16,19 +13,15 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import HashingVectorizer, TfidfTransformer, TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy.sparse import csr_matrix
 
 TOP_K = 50
 VAL_FRACTION = 0.1
 RANDOM_SEED = 42
-BATCH_SIZE = 200
-DESC_MAX_CHARS = 400
-TITLE_CHAR_NGRAMS = (3, 5)
-TITLE_HASH_FEATURES = 2**18
-DESC_MAX_FEATURES = 50_000
-DESC_MIN_DOC_FREQ = 3
-TITLE_WEIGHT = 0.8
-DESC_WEIGHT = 0.2
+MAX_TFIDF_FEATURES = 50_000
+MIN_DOC_FREQ = 3
+BATCH_SIZE = 200  # Размер батча ограничивает потребление памяти
 
 
 def load_data(train_path: Path) -> pd.DataFrame:
@@ -54,52 +47,22 @@ def make_query_level_split(train: pd.DataFrame, val_fraction: float, seed: int):
     return dev_queries, val_queries
 
 
-def build_index(items_corpus: pd.DataFrame):
-    """Строит два независимых индекса — по заголовку (char n-grams) и по
-    описанию (word-level) — их потом объединяем взвешенной суммой сходств."""
-    title_norm = items_corpus["item_title_raw"].fillna("").map(normalize_text)
-    desc_norm = (
-        items_corpus["item_description_raw"].fillna("").str.slice(0, DESC_MAX_CHARS).map(normalize_text)
-    )
-
-    title_hasher = HashingVectorizer(
-        analyzer="char_wb", ngram_range=TITLE_CHAR_NGRAMS,
-        n_features=TITLE_HASH_FEATURES, alternate_sign=False,
-    )
-    title_tfidf = TfidfTransformer()
-    title_matrix = title_tfidf.fit_transform(title_hasher.transform(title_norm)).tocsr()
-
-    desc_vectorizer = TfidfVectorizer(max_features=DESC_MAX_FEATURES, min_df=DESC_MIN_DOC_FREQ)
-    desc_matrix = desc_vectorizer.fit_transform(desc_norm).tocsr()
-
-    return (title_hasher, title_tfidf, title_matrix), (desc_vectorizer, desc_matrix)
+def build_index(corpus_text: pd.Series) -> tuple[TfidfVectorizer, csr_matrix]:
+    vectorizer = TfidfVectorizer(max_features=MAX_TFIDF_FEATURES, min_df=MIN_DOC_FREQ)
+    matrix = vectorizer.fit_transform(corpus_text).tocsr()
+    return vectorizer, matrix
 
 
 def retrieve_candidates(
-    query_texts: list[str],
-    title_index,
-    desc_index,
-    item_ids: np.ndarray,
-    top_k: int = TOP_K,
+    query_matrix, item_matrix, item_ids: np.ndarray, top_k: int = TOP_K
 ) -> list[list[str]]:
     """Возвращает top_k объявлений для каждого поискового запроса"""
-    title_hasher, title_tfidf, title_matrix = title_index
-    desc_vectorizer, desc_matrix = desc_index
-
-    query_norm = [normalize_text(q) for q in query_texts]
-    title_q = title_tfidf.transform(title_hasher.transform(query_norm)).tocsr()
-    desc_q = desc_vectorizer.transform(query_norm).tocsr()
-
-    title_matrix_t = title_matrix.T.tocsr()
-    desc_matrix_t = desc_matrix.T.tocsr()
-
+    item_matrix_t = item_matrix.T.tocsr()
     results: list[list[str]] = []
-    n = len(query_texts)
+    n = query_matrix.shape[0]
     for start in range(0, n, BATCH_SIZE):
         end = min(start + BATCH_SIZE, n)
-        sims = (title_q[start:end] @ title_matrix_t) * TITLE_WEIGHT
-        sims = sims + (desc_q[start:end] @ desc_matrix_t) * DESC_WEIGHT
-        sims = sims.tocsr()
+        sims = (query_matrix[start:end] @ item_matrix_t).tocsr()
         for local_i in range(end - start):
             row = sims.getrow(local_i)
             idx, data = row.indices, row.data
@@ -113,7 +76,11 @@ def retrieve_candidates(
 
 
 def recall_at_k(predictions: list[list[str]], relevant: list[set[str]]) -> float:
-    scores = [len(set(p) & r) / len(r) for p, r in zip(predictions, relevant) if r]
+    scores = []
+    for pred, rel in zip(predictions, relevant):
+        if not rel:
+            continue
+        scores.append(len(set(pred) & rel) / len(rel))
     return float(np.mean(scores))
 
 
@@ -126,12 +93,17 @@ def run_validation(train: pd.DataFrame) -> float:
         train.drop_duplicates("item_id")[["item_id", "item_title_raw", "item_description_raw"]]
         .reset_index(drop=True)
     )
+    corpus_text = (
+        items_corpus["item_title_raw"].fillna("") + " " + items_corpus["item_description_raw"].fillna("")
+    ).map(normalize_text)
+
+    vectorizer, item_matrix = build_index(corpus_text)
     item_ids = items_corpus["item_id"].values
 
-    title_index, desc_index = build_index(items_corpus)
-
     val_query_texts = list(val_relevant_map.keys())
-    predictions = retrieve_candidates(val_query_texts, title_index, desc_index, item_ids)
+    val_query_matrix = vectorizer.transform([normalize_text(q) for q in val_query_texts])
+
+    predictions = retrieve_candidates(val_query_matrix, item_matrix, item_ids)
     relevant = [val_relevant_map[q] for q in val_query_texts]
     return recall_at_k(predictions, relevant)
 
@@ -148,16 +120,23 @@ def generate_answer() -> None:
     print(f"Запросов: {len(queries)}")
     print(f"Объявлений: {len(items)}")
 
-    print("\nTF-IDF индексы")
-    title_index, desc_index = build_index(items)
-    item_ids = items["item_id"].astype(str).values
+    item_texts = (
+        items["item_title_raw"].fillna("")
+        + " "
+        + items["item_description_raw"].fillna("")
+    ).map(normalize_text)
+
+    print("\nTF-IDF индекс")
+    vectorizer, item_matrix = build_index(item_texts)
+
+    query_texts = queries["search_query"].fillna("").map(normalize_text)
+    query_matrix = vectorizer.transform(query_texts)
 
     print(f"top-{TOP_K} кандидатов")
     predictions = retrieve_candidates(
-        queries["search_query"].fillna("").tolist(),
-        title_index,
-        desc_index,
-        item_ids,
+        query_matrix,
+        item_matrix,
+        items["item_id"].astype(str).values,
         top_k=TOP_K,
     )
 
@@ -175,14 +154,12 @@ def generate_answer() -> None:
 
 def main() -> None:
     train_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("train.parquet")
-    print("Загрузка train")
+    print(f"Загрузка train")
     train = load_data(train_path)
     print(f"Строк: {len(train)}\nУникальных запросов: {train['search_query'].nunique()}")
 
     recall = run_validation(train)
-    print(
-        f"\nЛокальная валидация Recall@{TOP_K} = {recall:.6f}"
-    )
+    print(f"\nЛокальная валидация Recall@{TOP_K} = {recall:.6f}")
 
     generate_answer()
 
