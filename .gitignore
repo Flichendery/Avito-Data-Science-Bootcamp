@@ -1,0 +1,17 @@
+# Dataset
+*.parquet
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+
+# Answer
+answer.csv
